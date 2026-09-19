@@ -29,11 +29,15 @@ public class UndertowHttpServer implements HttpServer, ReadinessProbe {
 
     private final AtomicReference<HttpServerState> state = new AtomicReference<>(HttpServerState.INIT);
     private final ValueOf<? extends HttpServerConfig> config;
+    private final ValueOf<HttpHandler> httpHandler;
+    private final AtomicReference<@Nullable ConfiguredHandler> configuredHandler = new AtomicReference<>();
     private final GracefulShutdownHandler gracefulShutdown;
     private final String name;
     private final XnioWorker xnioWorker;
     @Nullable
     private final Configurer<Undertow.Builder> configurer;
+    @Nullable
+    private final Configurer<HttpHandler> handlerConfigurer;
 
     private volatile Undertow undertow;
 
@@ -47,13 +51,27 @@ public class UndertowHttpServer implements HttpServer, ReadinessProbe {
         this.name = name;
         this.xnioWorker = xnioWorker;
         this.configurer = configurer;
+        this.httpHandler = httpHandler;
+        this.handlerConfigurer = handlerConfigurer;
 
-        var handler = httpHandler.get();
-        if (handlerConfigurer != null) {
-            handler = handlerConfigurer.configure(handler);
-        }
-        this.gracefulShutdown = new GracefulShutdownHandler(handler);
+        // The handler is read per request: a graph refresh replaces it, and the server itself is not
+        // recreated (it would have to rebind an occupied port), so a handler captured here would keep
+        // serving requests with the configuration the refresh was supposed to replace.
+        this.gracefulShutdown = new GracefulShutdownHandler(exchange -> this.handler().handleRequest(exchange));
     }
+
+    private HttpHandler handler() {
+        var handler = this.httpHandler.get();
+        var configured = this.configuredHandler.get();
+        if (configured != null && configured.source == handler) {
+            return configured.handler;
+        }
+        var result = this.handlerConfigurer == null ? handler : this.handlerConfigurer.configure(handler);
+        this.configuredHandler.set(new ConfiguredHandler(handler, result));
+        return result;
+    }
+
+    private record ConfiguredHandler(HttpHandler source, HttpHandler handler) {}
 
     @Override
     public void init() {
